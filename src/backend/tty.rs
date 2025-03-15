@@ -19,6 +19,7 @@ use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
+use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType, VrrSupport,
 };
@@ -114,14 +115,14 @@ pub type TtyRendererError<'render> = <TtyRenderer<'render> as RendererSuper>::Er
 
 type GbmDrmCompositor = DrmCompositor<
     GbmAllocator<DrmDeviceFd>,
-    GbmDevice<DrmDeviceFd>,
+    GbmFramebufferExporter<DrmDeviceFd>,
     (OutputPresentationFeedback, Duration),
     DrmDeviceFd,
 >;
 
 pub struct OutputDevice {
     token: RegistrationToken,
-    render_node: DrmNode,
+    render_node: Option<DrmNode>,
     drm_scanner: DrmScanner,
     surfaces: HashMap<crtc::Handle, Surface>,
     known_crtcs: HashMap<crtc::Handle, CrtcInfo>,
@@ -129,6 +130,7 @@ pub struct OutputDevice {
     // See https://github.com/Smithay/smithay/issues/1102.
     drm: DrmDevice,
     gbm: GbmDevice<DrmDeviceFd>,
+    allocator: GbmAllocator<DrmDeviceFd>,
 
     pub drm_lease_state: Option<DrmLeaseState>,
     non_desktop_connectors: HashSet<(connector::Handle, crtc::Handle)>,
@@ -504,22 +506,48 @@ impl Tty {
         let (drm, drm_notifier) = DrmDevice::new(device_fd.clone(), true)?;
         let gbm = GbmDevice::new(device_fd)?;
 
-        let display = unsafe { EGLDisplay::new(gbm.clone())? };
-        let egl_device = EGLDevice::device_for_display(&display)?;
+        let mut try_initialize_gpu = || {
+            let display = unsafe { EGLDisplay::new(gbm.clone())? };
+            let egl_device = EGLDevice::device_for_display(&display)?;
 
-        let render_node = egl_device
-            .try_get_render_node()?
-            .context("no render node")?;
-        self.gpu_manager
-            .as_mut()
-            .add_node(render_node, gbm.clone())
-            .context("error adding render node to GPU manager")?;
+            let render_node = egl_device
+                .try_get_render_node()?
+                .context("no render node")?;
+            self.gpu_manager
+                .as_mut()
+                .add_node(render_node, gbm.clone())
+                .context("error adding render node to GPU manager")?;
 
-        if node == self.primary_node || render_node == self.primary_render_node {
+            anyhow::Ok(render_node)
+        };
+
+        let render_node = try_initialize_gpu()
+            .inspect_err(|err| {
+                warn!("failed to initialze renderer, falling back to primary gpu: {err:?}");
+            })
+            .ok();
+
+        let allocator = render_node
+            .is_some()
+            .then_some(&gbm)
+            .or(self
+                .devices
+                .get(&self.primary_node)
+                .map(|device| &device.gbm))
+            .map(|gbm| {
+                let gbm_flags = GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT;
+                GbmAllocator::new(gbm.clone(), gbm_flags)
+            })
+            .ok_or(anyhow!("no allocator available for device"))?;
+
+        let is_primary_render_node = render_node
+            .map(|render_node| render_node == self.primary_render_node)
+            .unwrap_or(false);
+        if node == self.primary_node || is_primary_render_node {
             if node == self.primary_node {
                 debug!("this is the primary node");
             }
-            if render_node == self.primary_render_node {
+            if is_primary_render_node {
                 debug!("this is the primary render node");
             }
 
@@ -552,10 +580,12 @@ impl Tty {
 
             // Create the dmabuf global.
             let primary_formats = renderer.dmabuf_formats();
-            let default_feedback =
-                DmabufFeedbackBuilder::new(render_node.dev_id(), primary_formats.clone())
-                    .build()
-                    .context("error building default dmabuf feedback")?;
+            let default_feedback = DmabufFeedbackBuilder::new(
+                self.primary_render_node.dev_id(),
+                primary_formats.clone(),
+            )
+            .build()
+            .context("error building default dmabuf feedback")?;
             let dmabuf_global = niri
                 .dmabuf_state
                 .create_global_with_default_feedback::<State>(
@@ -572,6 +602,7 @@ impl Tty {
                         primary_formats.clone(),
                         self.primary_render_node,
                         device.render_node,
+                        node,
                     ) {
                         Ok(feedback) => {
                             surface.dmabuf_feedback = Some(feedback);
@@ -607,6 +638,7 @@ impl Tty {
             render_node,
             drm,
             gbm,
+            allocator,
             drm_scanner: DrmScanner::new(),
             surfaces: HashMap::new(),
             known_crtcs: HashMap::new(),
@@ -754,8 +786,8 @@ impl Tty {
             lease_state.disable_global::<State>();
         }
 
-        if node == self.primary_node || device.render_node == self.primary_render_node {
-            match self.gpu_manager.single_renderer(&device.render_node) {
+        if node == self.primary_node || device.render_node == Some(self.primary_render_node) {
+            match self.gpu_manager.single_renderer(&self.primary_render_node) {
                 Ok(mut renderer) => renderer.unbind_wl_display(),
                 Err(err) => {
                     warn!("error creating renderer during device removal: {err}");
@@ -790,7 +822,9 @@ impl Tty {
             }
         }
 
-        self.gpu_manager.as_mut().remove_node(&device.render_node);
+        if let Some(render_node) = device.render_node {
+            self.gpu_manager.as_mut().remove_node(&render_node);
+        }
         niri.event_loop.remove(device.token);
 
         self.refresh_ipc_outputs(niri);
@@ -905,10 +939,6 @@ impl Tty {
             }
         }
 
-        // Create GBM allocator.
-        let gbm_flags = GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT;
-        let allocator = GbmAllocator::new(device.gbm.clone(), gbm_flags);
-
         // Update the output mode.
         let (physical_width, physical_height) = connector.size().unwrap_or((0, 0));
 
@@ -931,12 +961,16 @@ impl Tty {
             .insert_if_missing(|| TtyOutputState { node, crtc });
         output.user_data().insert_if_missing(|| output_name.clone());
 
-        let renderer = self.gpu_manager.single_renderer(&device.render_node)?;
+        let render_node = device.render_node.unwrap_or(self.primary_render_node);
+        let renderer = self.gpu_manager.single_renderer(&render_node)?;
         let egl_context = renderer.as_ref().egl_context();
         let render_formats = egl_context.dmabuf_render_formats();
 
         // Filter out the CCS modifiers as they have increased bandwidth, causing some monitor
         // configurations to stop working.
+        //
+        // For display only devices restrict to linear buffers as this should provide best
+        // compatibility
         //
         // The invalid modifier attempt below should make this unnecessary in some cases, but it
         // would still be a bad idea to remove this until Smithay has some kind of full-device
@@ -946,7 +980,7 @@ impl Tty {
             .iter()
             .copied()
             .filter(|format| {
-                !matches!(
+                let is_ccs = matches!(
                     format.modifier,
                     Modifier::I915_y_tiled_ccs
                     // I915_FORMAT_MOD_Yf_TILED_CCS
@@ -961,7 +995,9 @@ impl Tty {
                     | Modifier::Unrecognized(0x10000000000000b)
                     // I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC
                     | Modifier::Unrecognized(0x10000000000000c)
-                )
+                );
+
+                !is_ccs && (device.render_node.is_some() || format.modifier == Modifier::Linear)
             })
             .collect::<FormatSet>();
 
@@ -970,8 +1006,8 @@ impl Tty {
             OutputModeSource::Auto(output.clone()),
             surface,
             None,
-            allocator.clone(),
-            device.gbm.clone(),
+            device.allocator.clone(),
+            GbmFramebufferExporter::new(device.gbm.clone()),
             SUPPORTED_COLOR_FORMATS,
             // This is only used to pick a good internal format, so it can use the surface's render
             // formats, even though we only ever render on the primary GPU.
@@ -1000,8 +1036,8 @@ impl Tty {
                     OutputModeSource::Auto(output.clone()),
                     surface,
                     None,
-                    allocator,
-                    device.gbm.clone(),
+                    device.allocator.clone(),
+                    GbmFramebufferExporter::new(device.gbm.clone()),
                     SUPPORTED_COLOR_FORMATS,
                     render_formats,
                     device.drm.cursor_size(),
@@ -1024,6 +1060,7 @@ impl Tty {
                 primary_formats,
                 self.primary_render_node,
                 device.render_node,
+                node,
             ) {
                 Ok(feedback) => {
                     dmabuf_feedback = Some(feedback);
@@ -1379,7 +1416,7 @@ impl Tty {
 
         let mut renderer = match self.gpu_manager.renderer(
             &self.primary_render_node,
-            &device.render_node,
+            &device.render_node.unwrap_or(self.primary_render_node),
             surface.compositor.format(),
         ) {
             Ok(renderer) => renderer,
@@ -1708,7 +1745,7 @@ impl Tty {
         let device = self
             .devices
             .values()
-            .find(|d| d.render_node == self.primary_render_node);
+            .find(|d| d.render_node == Some(self.primary_render_node));
         // Otherwise, try to get the device corresponding to the primary node.
         let device = device.or_else(|| self.devices.get(&self.primary_node));
 
@@ -2162,7 +2199,8 @@ fn surface_dmabuf_feedback(
     compositor: &GbmDrmCompositor,
     primary_formats: FormatSet,
     primary_render_node: DrmNode,
-    surface_render_node: DrmNode,
+    surface_render_node: Option<DrmNode>,
+    surface_scanout_node: DrmNode,
 ) -> Result<SurfaceDmabufFeedback, io::Error> {
     let surface = compositor.surface();
     let planes = surface.planes();
@@ -2187,7 +2225,11 @@ fn surface_dmabuf_feedback(
 
     // HACK: AMD iGPU + dGPU systems share some modifiers between the two, and yet cross-device
     // buffers produce a glitched scanout if the modifier is not Linear...
-    if primary_render_node != surface_render_node {
+    // Also limit scan-out formats to linear if we have a device without a render node
+    if surface_render_node
+        .map(|surface_render_node| surface_render_node != primary_render_node)
+        .unwrap_or(true)
+    {
         primary_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
         primary_or_overlay_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
     }
@@ -2206,12 +2248,12 @@ fn surface_dmabuf_feedback(
     let scanout = builder
         .clone()
         .add_preference_tranche(
-            surface_render_node.dev_id(),
+            surface_scanout_node.dev_id(),
             Some(TrancheFlags::Scanout),
             primary_scanout_formats,
         )
         .add_preference_tranche(
-            surface_render_node.dev_id(),
+            surface_scanout_node.dev_id(),
             Some(TrancheFlags::Scanout),
             primary_or_overlay_scanout_formats,
         )
@@ -2219,7 +2261,10 @@ fn surface_dmabuf_feedback(
 
     // If this is the primary node surface, send scanout formats in both tranches to avoid
     // duplication.
-    let render = if primary_render_node == surface_render_node {
+    let render = if surface_render_node
+        .map(|surface_render_node| surface_render_node == primary_render_node)
+        .unwrap_or(false)
+    {
         scanout.clone()
     } else {
         builder.build()?
