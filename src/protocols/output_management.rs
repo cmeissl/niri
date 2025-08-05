@@ -633,8 +633,17 @@ where
                 height,
                 refresh,
             } => {
+                let Some(current_config) = g_state.current_state.get(output_id) else {
+                    warn!("SetCustomMode: output missing from the current config");
+                    return;
+                };
+
                 let (width, height, refresh): (u16, u16, u32) =
                     match (width.try_into(), height.try_into(), refresh.try_into()) {
+                        (Ok(width), Ok(height), Ok(_refresh)) if (height == 0 || width == 0) => {
+                            warn!("SetCustomMode: invalid input data");
+                            return;
+                        }
                         (Ok(width), Ok(height), Ok(refresh)) => (width, height, refresh),
                         _ => {
                             warn!("SetCustomMode: invalid input data");
@@ -642,8 +651,20 @@ where
                         }
                     };
 
+                let mut custom = true;
+                if let Some(_mode) = current_config.modes.iter().find(|m| {
+                    m.height == height
+                        && m.width == width
+                        && (refresh == 0 || m.refresh_rate == refresh)
+                }) {
+                    custom = false;
+                } else if refresh == 0 {
+                    warn!("SetCustomMode: invalid input data");
+                    return;
+                }
+
                 new_config.mode = Some(niri_config::Mode {
-                    custom: true,
+                    custom,
                     mode: niri_ipc::ConfiguredMode {
                         width,
                         height,
